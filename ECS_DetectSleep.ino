@@ -1,5 +1,5 @@
 /*   ECS_DetectSleep.ino
- Purpose: Mid term demo
+ Purpose: Mid term demo/Final demo
  Authot: Tiago Pimentel
         t.pimentelms@gmail.com
  CSE 467S -- Embedded Computing Systems
