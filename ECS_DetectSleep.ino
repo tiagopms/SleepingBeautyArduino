@@ -11,6 +11,10 @@
    APPLYING_MEASURES >= 1
    STILL_TIME >= 10
    ROUGH_MOVE_TIMEOUT >= 5
+   MAX_HEART_MEASURE_TIME >= 1000
+   MIN_HEART_MEASURE_TIME < 500
+   MAX_HEART_RATE > 80
+   NUMBER_OF_MEASURES > 5
  Description:
    Use a relay to turn lights on or off
    Turn off the lights if :
@@ -35,17 +39,28 @@
      Created reallyRoughMovement function;
      Decided the serial comunication protocol;
      Corrected minor bugs, as light not turning on with reallyRoughMovement;
-
+   04/29/2013, Tiago Pimentel
+     Add heart rate device reading functions;
+   04/30/2013, Tiago Pimentel
+     Adjusted heart rate device reading function not to work inside interrupt;
+     Adjusted current heart rate to be dynamic and not calculated on new measures every time;
 */
 #include <Time.h>  
 
 //constants definitions
-#define LEARNING_MEASURES 100
-#define APPLYING_MEASURES 100
+//reading heart rate device data constants
+#define MAX_HEART_MEASURE_TIME 2000
+#define MIN_HEART_MEASURE_TIME 200
+#define MAX_HEART_RATE 120
+#define NUMBER_OF_MEASURES 25
+//applying heart rate measurements constants
+#define LEARNING_MEASURES 5
+#define APPLYING_MEASURES 10
+//cellphone accelerometer constants
 #define STILL_TIME 100
 #define ROUGH_MOVE_TIMEOUT 60
 
-//variables declaration
+//variables related to serial incoming data declaration
 //incoming data from serial
 float incomingByte = 0;
 //setting time in arduino
@@ -59,64 +74,237 @@ int typeOfData = 1;
 //decodes string to int variable
 unsigned long int timeData = 0;
 uint64_t timeDataLong = 0;
-//constant related to percentage of chance to be asleep, changes velocity of heart rate lowering response
-float heartRatePercentConstant = 0;
 
 //give a name to relay pin and sets a variable with its state
-int relay = 4;
+#define RELAY 4
 int isOff = false;
+
+///reading heart rate device constants and variables
+//gives a name to the heart beat led, the heart measurement error led, and the bounce measure led
+#define HEART_LED 8
+#define HEART_ERROR_LED 6
+#define HEART_BOUNCED_ERROR_LED 7
+//array with times from last heart beats
+unsigned long timeArray[NUMBER_OF_MEASURES + 1];
+//variable that saves if current measurement state has no error
+bool noDataErrors = true;
+//counter that saves current number of heart beats
+unsigned char counter;
+//catches heart beat interrupt to be ran as normal code
+volatile boolean isGetHeartBeat = false;
+
+//applying heart rate's data variables
+//constant related to percentage of chance to be asleep, changes velocity of heart rate lowering response
+float heartRatePercentConstant = 0.85;
+//array with current heart rate data
+unsigned long currentHeartRateArray[APPLYING_MEASURES + 1];
+//counters of number of measurements
+float timesCalled = 0;
+int currentCounter = 0;
+bool isReadyToUseData = false;
 
 //arduino setup
 void setup(){
-  // initialize the relay pin as an output.
-  pinMode(relay, OUTPUT);
+  // initialize the relay, heart rate led and heart rate measurement errors pins as outputs
+  pinMode(RELAY, OUTPUT);
+  pinMode(HEART_LED, OUTPUT);
+  pinMode(HEART_ERROR_LED, OUTPUT);
+  pinMode(HEART_BOUNCED_ERROR_LED, OUTPUT);
   //start serial reading and writing
   Serial.begin(9600);
   
-  // if analog input pin 0 is unconnected, random analog
-  // noise will cause the call to randomSeed() to generate
-  // different seed numbers each time the sketch runs.
-  // randomSeed() will then shuffle the random function.
-  randomSeed(analogRead(0));
+  //sends system starting message and waits for 5 seconds for chest strap adjusting
+  Serial.println("Starting system");
+  delay(5000);
+  Serial.println("System started");
+  
+  //inits time array used to get heart rate in bpm
+  initTimeArray();
+  
+  //set interrupt 0, in digital port 2, to handle heart rate beat data income
+  attachInterrupt(0, allowGetHeartBeat, RISING);
 }
 
-//analyses heart beat data from sensor
-//receives the heartRate
-void heartBeatData (int heartRate) {
+///analyses heart beat data from sensor
+// interrupt function that allows getting one heart beat time by main loop
+void allowGetHeartBeat() {
+  isGetHeartBeat = true;
+}
+
+//initialize array used for heart beats times storing
+void initTimeArray() {
+  for(unsigned char i=0; i < NUMBER_OF_MEASURES; i++) {
+    timeArray[i]=0;
+  }
+  timeArray[NUMBER_OF_MEASURES]=millis();
+}
+
+//message that gives error message, restarts heart beat data aquirement and sets error led to HIGH 
+void errorHeartBeat() {
+  noDataErrors = false;
+  counter=0;
+  Serial.println("Heart rate measure error, test will restart!" );
+  initTimeArray();
+  digitalWrite(HEART_ERROR_LED, HIGH);
+}
+
+//calculates heart beat rate based on last NUMBER_OF_MEASURES heart beats times
+void calculateHeartRate() {
+  //variable with heart rate in bpm
+  unsigned int heartRate;
+  
+  //if no errors in the data , calculate heart rate
+  if(noDataErrors) {
+    //gets heart rate in bpm (beats per minute 60*20*1000/20_total_time)
+    heartRate = 1200000/(timeArray[NUMBER_OF_MEASURES]-timeArray[0]);
+    
+    //prints data in serial so laptop sends to internet
+    Serial.print("DATA 2 ");
+    Serial.println(heartRate);
+    
+    //if heart rate not over a maximum threshold lowers state of error led and use this data
+    if (heartRate > MAX_HEART_RATE) {
+      errorHeartBeat();
+    } else {
+      digitalWrite(HEART_ERROR_LED, LOW);
+      heartBeatData(heartRate);
+    }
+  }
+  //if there are errors, reinitializes them
+  noDataErrors = true;
+}
+
+//receives one heart rate sensor beat and saves its time to calculate heart rate in bpm
+void getHeartBeat() {
+  //variable with time between current beat and last
+  unsigned long measureTime;
+  //variable with heart beat led state
+  static boolean heartLed = false;
+  //saves bounce error, so if two concecutive errors reset measure
+  static boolean bouncedSignal = false;
+  
+  //gets current time to time array
+  timeArray[counter] = millis();
+  
+  //prints in serial heart beats sensor counter
+  Serial.print(F("Heart counter:\t"));
+  Serial.println(counter,DEC);
+  
+  //sets heart led state and changes it for next run so light changes in heart frequency
+  digitalWrite(HEART_LED, heartLed);
+  if(heartLed) {
+    heartLed = false;
+  } else {
+    heartLed = true;
+  }
+  
+  //if first measure, compare time to last measure in array, else with last before this one
+  switch(counter) {
+    case 0:
+      measureTime = timeArray[counter]-timeArray[NUMBER_OF_MEASURES];
+      break;
+    default:
+      measureTime = timeArray[counter]-timeArray[counter-1];
+      break;
+  }
+  
+  //sets MAX_HEART_MEASURE_TIME/1000 seconds as max time for single heart beat and 1.5*MIN_HEART_MEASURE_TIME/1000 as min time for 3 consecutive heart beats or resets data aquiring
+  if(measureTime > MAX_HEART_MEASURE_TIME || (measureTime < 1.5*MIN_HEART_MEASURE_TIME && bouncedSignal)) {
+    //sign error and reset current measures
+    errorHeartBeat();
+  }
+  
+  //sets MIN_HEART_MEASURE_TIME/1000 seconds as min time for 2 consecutive heart beats or sets bounce measure as on
+  if (measureTime < MIN_HEART_MEASURE_TIME && !bouncedSignal) {
+    Serial.println("Heart rate bounced measure error!" );
+    digitalWrite(HEART_BOUNCED_ERROR_LED, HIGH);
+    bouncedSignal = true;
+  } else {
+    //sets bounce data as false and lowers bounce error led state
+    digitalWrite(HEART_BOUNCED_ERROR_LED, LOW);
+    bouncedSignal = false;
+    
+    //if last measure and no errors calculates heart beating rate
+    if (counter == NUMBER_OF_MEASURES && noDataErrors) {
+      counter = 0;
+      calculateHeartRate();
+    //if not last measure and no errors raise counter
+    } else if(counter != NUMBER_OF_MEASURES && noDataErrors) {
+      counter++;
+    //if error resets counter and erases error
+    } else {
+      counter = 0;
+      noDataErrors = true;
+    }
+  }
+}
+
+//uses heart rate data aquired
+//resets learned measures when light is turned on again
+float resetLearnedHeartRate() {
+  timesCalled = 0;
+  currentCounter = 0;
+  isReadyToUseData = false;
+}
+
+//calculates current heart beat rate using a mean from all measures in currentHeartRateArray
+float calculateCurrentHeartRate() {
+  float localCurrentHeartRate = 0;
+  
+  for(unsigned char i=0; i <= APPLYING_MEASURES; i++) {
+    localCurrentHeartRate += currentHeartRateArray[i]/(APPLYING_MEASURES*1.0 + 1.0);
+  }
+  
+  return localCurrentHeartRate;
+}
+
+//learns heart rate mean from person and them uses current mean to if smaller than 90% of mean, turn off light
+void heartBeatData (unsigned long heartRate) {
+  //if light off, no need to run code
   if(isOff) {
     return;
   }
   
   //current and learned heart rates
   static float heartRatesMean = 0;
-  static float currentHeartRate = 0;
-  //counters of number of measurements
-  static float timesCalled = 0;
-  static float currentCounter = 0;
+  float currentHeartRate = 0;
   //update number of times data received
   timesCalled++;
   
   //learning heart rate mean
   if (timesCalled <= LEARNING_MEASURES) {
-    heartRatesMean = heartRatesMean*(timesCalled - 1)/timesCalled + incomingByte/timesCalled;
+    if(timesCalled == 1) {
+      heartRatesMean = 1;
+    }
+    heartRatesMean = heartRatesMean*(timesCalled - 1)/timesCalled + heartRate/timesCalled;
     Serial.print("Heart Rates: ");
     Serial.println(heartRatesMean);
   }
   //applying heart rate mean measured
   else {
+    //increase current counter
     currentCounter++;
-    //getting current heart rates mean
-    currentHeartRate = currentHeartRate*(currentCounter - 1)/currentCounter + incomingByte/currentCounter;
-    Serial.print("Current Heart Rate: ");
-    Serial.println(currentHeartRate);
-    //check if new mean is smaller than 90% of original
+    //getting current heart rates
+    currentHeartRateArray[currentCounter] = heartRate;
+    
+    //if last measure, go back to start and sets heart rate as ready
     if (currentCounter == APPLYING_MEASURES) {
+      isReadyToUseData = true;
       currentCounter = 0;
-      Serial.println("Final!");
-      if (currentHeartRate < heartRatesMean*0.9) {
-        Serial.println("Lower");
-        digitalWrite(relay, HIGH);   // turn the LED on (HIGH is the voltage level)
+    }
+    
+    //check if new mean is smaller than 90% of original
+    if(isReadyToUseData) {
+      //getting current heart rates mean
+      currentHeartRate = calculateCurrentHeartRate();
+      Serial.print("Current Heart Rate: ");
+      Serial.println(currentHeartRate);
+      //if smaller than heartRatePercentConstant% of original heart rate, turn off light 
+      if (currentHeartRate < heartRatesMean * heartRatePercentConstant) {
+        digitalWrite(RELAY, HIGH);
         isOff = true;
+        Serial.println("DATA 0");
+        turnOffTime = startingTime + (unsigned long int) (millis()/1000.0);
       }
     }
   }
@@ -129,23 +317,23 @@ void timeWithoutMovement (unsigned long int time) {
   Serial.println(time);
   //if no movement in an amount of time change needed heart rate lowering response to 5% instead of 10%
   if (time > STILL_TIME && !isOff) {
+    Serial.println("Large time without movement!");
     //since no heart rate changed to just turn off light
-    //heartRatePercentConstant = 0.95/0.9;
-    digitalWrite(relay, HIGH);
-    Serial.println("DATA 0");
-    turnOffTime = startingTime + (unsigned long int) (millis()/1000.0);
-    isOff = true;
+    heartRatePercentConstant = 0.93;
   }
 }
 
 //turns on or off the light
 //receives a int indicating if it should turn the light on or off
 int switchLight (int turnOn) {
+  Serial.print("Switch light received: ");
+  Serial.println(turnOn);
   if(turnOn) {
-    digitalWrite(relay, LOW); //low to allow light on
+    digitalWrite(RELAY, LOW); //low to allow light on
     isOff = false;
+    resetLearnedHeartRate();
   } else {
-    digitalWrite(relay, HIGH); //high to turn off light
+    digitalWrite(RELAY, HIGH); //high to turn off light
     if(!isOff) {
       turnOffTime = 0;
     }
@@ -158,15 +346,18 @@ int switchLight (int turnOn) {
 int reallyRoughMovement (unsigned long int time) {
   //if off, turn on
   if (  isOff && (startingTime + (unsigned long int) (millis()/1000.0) < turnOffTime + (unsigned long int) ROUGH_MOVE_TIMEOUT) && (time > turnOffTime) ) {
-    digitalWrite(relay, LOW); //low to allow light on
+    digitalWrite(RELAY, LOW); //low to allow light on
     Serial.println("DATA 1");
     isOff = false;
+    resetLearnedHeartRate();
   }
 }
 
 //main loop running in arduino
 void loop() {
-  //Serial.print("Loop");
+  //Serial.println("Loop");
+  delay(10);
+  
   // analyse data only when you receive data:
   if (Serial.available() > 0) {
     //Serial.println("R");
@@ -321,9 +512,19 @@ void loop() {
               typeOfData = 1;
             }
             break;
+          default:
+            Serial.println("Error: Invalid data, not a valid type");
+            typeOfData = 1;
+            break;
         }
       }
     }
+  }
+  
+  //if interrupt with heart beat, gets heart beat time and uses it
+  if(isGetHeartBeat) {
+    getHeartBeat();
+    isGetHeartBeat = false;
   }
 }
 
